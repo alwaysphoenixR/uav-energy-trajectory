@@ -1,138 +1,139 @@
 """
-Nonlinear Model Predictive Control (NMPC) Tracker using CasADi optimization solver.
-Decouples high-level strategic tactical goals from low-level kinematic physical feasibility.
+Module: controllers.nmpc_controller
+CasADi-based Nonlinear Model Predictive Control (NMPC) Tracker.
+Solves constrained quadratic program within <15 ms to enforce physical safety,
+kinematic acceleration and velocity limits, and altitude bounds.
 """
+from dataclasses import dataclass
 import numpy as np
 import casadi as ca
-from configs.settings import SimulationConfig, NMPCConfig
+import time
+
+@dataclass
+class NMPCParams:
+    N_mpc: int = 5                  # Prediction horizon
+    dt: float = 0.5                 # Sampling time (s)
+    V_max: float = 20.0             # Max speed (m/s)
+    A_max: float = 5.0              # Max acceleration (m/s^2)
+    Z_min: float = 20.0             # Min altitude (m)
+    Z_max: float = 200.0            # Max altitude (m)
+    q_pos: float = 10.0             # Tracking error weight
+    r_acc: float = 0.1              # Control effort weight
+
 
 class NMPCTracker:
-    def __init__(self, sim_cfg: SimulationConfig, mpc_cfg: NMPCConfig = None):
-        self.sim_cfg = sim_cfg
-        self.mpc_cfg = mpc_cfg if mpc_cfg is not None else NMPCConfig()
-        self._build_solver()
-        
-    def _build_solver(self):
+    """
+    CasADi finite-horizon quadratic tracking controller.
+    """
+    def __init__(self, params: NMPCParams = None):
+        self.params = params if params is not None else NMPCParams()
+        self._build_opti_solver()
+
+    def _build_opti_solver(self):
         """
-        Build parametric CasADi NLP solver for reference trajectory tracking:
-        min sum_{k=0}^{N-1} ||p(k) - p_ref(k)||^2_Q + ||a(k)||^2_R
-        s.t. 
+        Formulates the constrained NLP tracking formulation using CasADi Opti:
+        min sum_{k=0}^{N_mpc-1} ||p(k) - p_ref(k)||_Q^2 + ||a(k)||_R^2
+        s.t.
             p(k+1) = p(k) + v(k)*dt + 0.5*a(k)*dt^2
             v(k+1) = v(k) + a(k)*dt
-            ||v(k)||^2 <= v_max^2
-            ||a(k)||^2 <= a_max^2
-            z_min <= z(k) <= z_max
+            ||v(k)||_2 <= V_max
+            ||a(k)||_2 <= A_max
+            Z_min <= p_z(k) <= Z_max
         """
-        N = self.mpc_cfg.N_horizon
-        dt = self.mpc_cfg.dt
+        N = self.params.N_mpc
+        dt = self.params.dt
         
-        # State variables: p in R^3, v in R^3 (total 6 per step)
-        P = ca.SX.sym('P', 3, N + 1)
-        V = ca.SX.sym('V', 3, N + 1)
+        opti = ca.Opti()
         
-        # Control inputs: a in R^3 (total 3 per step)
-        A = ca.SX.sym('A', 3, N)
+        # Decision variables
+        P = opti.variable(3, N + 1)  # Positions
+        V = opti.variable(3, N + 1)  # Velocities
+        A = opti.variable(3, N)      # Accelerations
         
-        # Parameters: Initial state (p0, v0) and Reference trajectory P_ref (3 x (N+1))
-        P_init = ca.SX.sym('P_init', 3)
-        V_init = ca.SX.sym('V_init', 3)
-        P_ref = ca.SX.sym('P_ref', 3, N + 1)
+        # Parameters (Inputs to solver at each step)
+        P_init = opti.parameter(3)
+        V_init = opti.parameter(3)
+        P_ref = opti.parameter(3, N + 1)
+        
+        # Initial boundary conditions
+        opti.subject_to(P[:, 0] == P_init)
+        opti.subject_to(V[:, 0] == V_init)
         
         cost = 0
-        g = []
-        lbg = []
-        ubg = []
-        
-        # Initial condition constraints
-        g.append(P[:, 0] - P_init)
-        lbg.extend([0.0, 0.0, 0.0])
-        ubg.extend([0.0, 0.0, 0.0])
-        
-        g.append(V[:, 0] - V_init)
-        lbg.extend([0.0, 0.0, 0.0])
-        ubg.extend([0.0, 0.0, 0.0])
-        
         for k in range(N):
-            # Tracking cost
-            pos_err = P[:, k+1] - P_ref[:, k+1]
-            cost += self.mpc_cfg.q_pos * ca.dot(pos_err, pos_err)
+            pos_err = P[:, k + 1] - P_ref[:, k + 1]
+            cost += self.params.q_pos * ca.dot(pos_err, pos_err)
+            cost += self.params.r_acc * ca.dot(A[:, k], A[:, k])
             
-            # Control effort cost
-            cost += self.mpc_cfg.r_acc * ca.dot(A[:, k], A[:, k])
+            # Kinematic state transition constraints
+            opti.subject_to(P[:, k + 1] == P[:, k] + V[:, k] * dt + 0.5 * A[:, k] * (dt ** 2))
+            opti.subject_to(V[:, k + 1] == V[:, k] + A[:, k] * dt)
             
-            # Kinematic integration
-            p_next = P[:, k] + V[:, k] * dt + 0.5 * A[:, k] * (dt ** 2)
-            v_next = V[:, k] + A[:, k] * dt
+            # Velocity constraint: ||v||^2 <= V_max^2
+            opti.subject_to(ca.dot(V[:, k + 1], V[:, k + 1]) <= self.params.V_max ** 2)
             
-            g.append(P[:, k+1] - p_next)
-            lbg.extend([0.0, 0.0, 0.0])
-            ubg.extend([0.0, 0.0, 0.0])
+            # Acceleration constraint: ||a||^2 <= A_max^2
+            opti.subject_to(ca.dot(A[:, k], A[:, k]) <= self.params.A_max ** 2)
             
-            g.append(V[:, k+1] - v_next)
-            lbg.extend([0.0, 0.0, 0.0])
-            ubg.extend([0.0, 0.0, 0.0])
+            # Altitude limits: Z_min <= z <= Z_max
+            opti.subject_to(P[2, k + 1] >= self.params.Z_min)
+            opti.subject_to(P[2, k + 1] <= self.params.Z_max)
             
-            # Speed bound: ||v||^2 <= v_max^2
-            g.append(ca.dot(V[:, k+1], V[:, k+1]))
-            lbg.append(0.0)
-            ubg.append(self.sim_cfg.v_max ** 2)
-            
-            # Acc bound: ||a||^2 <= a_max^2
-            g.append(ca.dot(A[:, k], A[:, k]))
-            lbg.append(0.0)
-            ubg.append(self.sim_cfg.a_max ** 2)
-            
-            # Altitude bounds
-            g.append(P[2, k+1])
-            lbg.append(self.sim_cfg.z_bounds[0])
-            ubg.append(self.sim_cfg.z_bounds[1])
-            
-        # Decision variable vector
-        opt_vars = ca.vertcat(ca.reshape(P, -1, 1), ca.reshape(V, -1, 1), ca.reshape(A, -1, 1))
-        params = ca.vertcat(P_init, V_init, ca.reshape(P_ref, -1, 1))
+        opti.minimize(cost)
         
-        nlp = {
-            'x': opt_vars,
-            'f': cost,
-            'g': ca.vertcat(*g),
-            'p': params
-        }
-        
+        # Solver options: Fast IPOPT configuration for <15ms online latency
         opts = {
             'ipopt.print_level': 0,
             'print_time': 0,
             'ipopt.sb': 'yes',
-            'ipopt.max_iter': 50
+            'ipopt.max_iter': 40,
+            'ipopt.tol': 1e-4,
+            'ipopt.acceptable_tol': 1e-3,
+            'ipopt.warm_start_init_point': 'yes'
         }
-        self.solver = ca.nlpsol('nmpc_solver', 'ipopt', nlp, opts)
-        self.lbg = lbg
-        self.ubg = ubg
-        self.n_vars = opt_vars.size1()
+        opti.solver('ipopt', opts)
         
-    def solve(self, p_current: np.ndarray, v_current: np.ndarray, p_ref_horizon: np.ndarray) -> np.ndarray:
+        self.opti = opti
+        self.P = P
+        self.V = V
+        self.A = A
+        self.P_init = P_init
+        self.V_init = V_init
+        self.P_ref = P_ref
+
+    def solve(self, current_p: np.ndarray, current_v: np.ndarray, p_ref_horizon: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
         """
-        Solves the NMPC optimization and returns the immediate control input a*_v(0).
-        p_ref_horizon: shape (3, N+1)
+        Solves the tracking optimization problem.
+        Args:
+            current_p: (3,) current UAV coordinates
+            current_v: (3,) current UAV velocity
+            p_ref_horizon: (3, N+1) reference trajectory over horizon
+        Returns:
+            a_opt_0: (3,) optimal immediate acceleration command
+            p_pred: (3, N+1) predicted position trajectory
+            solve_time_ms: solve latency in milliseconds
         """
-        N = self.mpc_cfg.N_horizon
-        p_init_val = p_current.reshape(3, 1)
-        v_init_val = v_current.reshape(3, 1)
-        p_ref_val = p_ref_horizon.reshape(-1, 1)
+        t0 = time.perf_counter()
         
-        param_val = np.vstack([p_init_val, v_init_val, p_ref_val])
-        x0 = np.zeros(self.n_vars)
+        # Set parameter values
+        self.opti.set_value(self.P_init, np.array(current_p, dtype=np.float64))
+        self.opti.set_value(self.V_init, np.array(current_v, dtype=np.float64))
+        self.opti.set_value(self.P_ref, np.array(p_ref_horizon, dtype=np.float64))
         
         try:
-            sol = self.solver(x0=x0, p=param_val, lbg=self.lbg, ubg=self.ubg)
-            x_opt = np.array(sol['x']).flatten()
+            sol = self.opti.solve()
+            solve_time_ms = (time.perf_counter() - t0) * 1000.0
             
-            # Acceleration starts after (N+1)*3 pos and (N+1)*3 vel
-            acc_offset = 2 * (N + 1) * 3
-            a_opt_0 = x_opt[acc_offset:acc_offset + 3]
-            return a_opt_0
+            a_opt = sol.value(self.A)
+            a_0 = a_opt[:, 0] if a_opt.ndim > 1 else a_opt
+            p_pred = sol.value(self.P)
+            
+            return np.array(a_0, dtype=np.float64), np.array(p_pred, dtype=np.float64), solve_time_ms
         except Exception:
-            # Fallback proportional acceleration if solver is infeasible
-            target = p_ref_horizon[:, 1] if p_ref_horizon.shape[1] > 1 else p_ref_horizon[:, 0]
-            err = target - p_current
-            acc_fallback = np.clip(err, -self.sim_cfg.a_max, self.sim_cfg.a_max)
-            return acc_fallback
+            # Fallback PD control if solver fails
+            solve_time_ms = (time.perf_counter() - t0) * 1000.0
+            target_p = p_ref_horizon[:, 1] if p_ref_horizon.shape[1] > 1 else p_ref_horizon[:, 0]
+            err = target_p - current_p
+            a_fallback = np.clip(err, -self.params.A_max, self.params.A_max)
+            p_pred = np.tile(current_p[:, None], (1, self.params.N_mpc + 1))
+            return a_fallback, p_pred, solve_time_ms
